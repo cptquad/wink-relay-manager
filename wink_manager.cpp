@@ -6,8 +6,17 @@
 
 #include <map>
 #include <functional>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <strings.h>
 
 #include <sys/reboot.h>
+#include <signal.h>
+#include <unistd.h>
 
 // prefix/buttons/index/action/clicks
 #define MQTT_BUTTON_TOPIC_FORMAT "%s/buttons/%d/%s/%d"
@@ -36,6 +45,43 @@ enum RelayFlags {
   RELAY_FLAG_TOGGLE_OPPOSITE = 1 << 5,
 };
 
+static std::string trim(std::string s) {
+  auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+  s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
+  s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
+  return s;
+}
+
+static bool isDigits(const std::string& s) {
+  if (s.empty()) return false;
+  return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c); });
+}
+
+static std::vector<std::string> splitWhitespace(const std::string& s) {
+  std::istringstream iss(s);
+  std::vector<std::string> out;
+  std::string part;
+  while (iss >> part) out.push_back(part);
+  return out;
+}
+
+static bool spawnDetached(const std::vector<std::string>& argv) {
+  if (argv.empty()) return false;
+  pid_t pid = fork();
+  if (pid < 0) return false;
+  if (pid == 0) {
+    // child
+    (void)setsid();
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
+    cargv.push_back(nullptr);
+    execvp(cargv[0], cargv.data());
+    _exit(127);
+  }
+  return true;
+}
+
 struct Config {
   std::string mqttClientId = "Relay";
   std::string mqttUsername;
@@ -46,6 +92,13 @@ struct Config {
   bool sendScreenState = false;
   bool sendProximityTrigger = false;
   short relayFlags[2] = { RELAY_FLAG_SEND_CLICK | RELAY_FLAG_SEND_HELD, RELAY_FLAG_SEND_CLICK | RELAY_FLAG_SEND_HELD };
+
+  // MQTT-triggered alert sound playback
+  std::string alertSound = "/system/media/audio/ui/Effect_Tick.ogg";
+  std::string alertPlayer;       // e.g. stagefright, tinyplay, aplay, or absolute path
+  std::string alertPlayerArgs;   // optional extra args (whitespace-separated)
+  int alertMaxCount = 5;         // cap repeats
+  int alertRepeatDelayMs = 300;  // delay between repeats
 };
 
 class WinkRelayManager : public RelayCallbacks {
@@ -247,6 +300,18 @@ public:
       bool state = false;
       processStatePayload(value, strlen(value), state);
       m_config.sendScreenState = state;
+    } else if (strcmp(name, "alert_sound") == 0) {
+      m_config.alertSound = value;
+    } else if (strcmp(name, "alert_player") == 0) {
+      m_config.alertPlayer = value;
+    } else if (strcmp(name, "alert_player_args") == 0) {
+      m_config.alertPlayerArgs = value;
+    } else if (strcmp(name, "alert_max_count") == 0) {
+      int c = atoi(value);
+      if (c > 0) m_config.alertMaxCount = c;
+    } else if (strcmp(name, "alert_repeat_delay_ms") == 0) {
+      int ms = atoi(value);
+      if (ms >= 0) m_config.alertRepeatDelayMs = ms;
     } else if (strcmp(name, "debug") == 0) {
       if (strcmp(value, "true") == 0) {
         spdlog::set_level(spdlog::level::debug);
@@ -279,10 +344,93 @@ public:
     exit(EXIT_SUCCESS);
   }
 
+  bool playAlertSoundOnce(const std::string& soundPath) {
+    if (soundPath.empty()) return false;
+
+    std::vector<std::string> argv;
+    if (!m_config.alertPlayer.empty()) {
+      argv.push_back(m_config.alertPlayer);
+      auto extra = splitWhitespace(m_config.alertPlayerArgs);
+      argv.insert(argv.end(), extra.begin(), extra.end());
+      argv.push_back(soundPath);
+    } else {
+      // Best-effort default for Android-based devices:
+      // stagefright typically supports many formats (ogg/mp3/wav).
+      argv = {"stagefright", "-a", soundPath};
+    }
+
+    log->info("Alert: playing [{}] via [{}]", soundPath, argv.empty() ? "" : argv[0]);
+    return spawnDetached(argv);
+  }
+
+  void scheduleAlertPlays(const std::string& soundPath, int count) {
+    if (count <= 0) return;
+    int maxCount = std::max(m_config.alertMaxCount, 1);
+    int capped = std::min(std::max(count, 1), maxCount);
+
+    // Play immediately, then schedule repeats.
+    playAlertSoundOnce(soundPath);
+    for (int i = 1; i < capped; ++i) {
+      auto delay = std::chrono::milliseconds(std::max(m_config.alertRepeatDelayMs, 0) * i);
+      m_relay.scheduler().Schedule(delay, [this, soundPath] (tsc::TaskContext) {
+        playAlertSoundOnce(soundPath);
+      });
+    }
+  }
+
+  void handleAlertMessage(MQTTAsync_message* msg) {
+    std::string payload;
+    if (msg && msg->payload && msg->payloadlen > 0) {
+      payload.assign(static_cast<const char*>(msg->payload), msg->payloadlen);
+    }
+    payload = trim(payload);
+
+    std::string sound = m_config.alertSound;
+    int count = 1;
+
+    if (payload.empty() || payload == "1" || strncasecmp(payload.c_str(), "on", payload.size()) == 0) {
+      // default sound, once
+    } else if (strncasecmp(payload.c_str(), "default", payload.size()) == 0) {
+      // default sound, once
+    } else {
+      // Accept either:
+      // - "<count>" (use default sound)
+      // - "<path>" (play that sound once)
+      // - "<path>,<count>"
+      auto comma = payload.find(',');
+      if (comma != std::string::npos) {
+        std::string left = trim(payload.substr(0, comma));
+        std::string right = trim(payload.substr(comma + 1));
+        if (!left.empty()) sound = left;
+        if (isDigits(right)) count = atoi(right.c_str());
+      } else if (isDigits(payload)) {
+        count = atoi(payload.c_str());
+      } else {
+        sound = payload;
+      }
+    }
+
+    if (sound.empty()) {
+      log->error("Alert: no sound path configured (set alert_sound)");
+      return;
+    }
+    if (count <= 0) {
+      log->warn("Alert: ignoring non-positive count {}", count);
+      return;
+    }
+
+    // Don't block the MQTT callback thread; schedule on the relay scheduler.
+    m_relay.scheduler().Async([this, sound, count]() {
+      scheduleAlertPlays(sound, count);
+    });
+  }
+
   void start() {
     log = spdlog::android_logger("log", "wink_manager");
     log->flush_on(spdlog::level::info);
     log->info("Wink Manager started");
+    // Avoid zombies from detached alert player processes.
+    signal(SIGCHLD, SIG_IGN);
     // parse config
     if (ini_parse("/sdcard/wink_manager.ini", _configHandler, this) < 0) {
       log->error("Can't load /sdcard/wink_manager.ini");
@@ -296,6 +444,7 @@ public:
     // commands
     m_messageCallbacks.emplace(m_config.mqttTopicPrefix + "/command/reboot", std::bind(&WinkRelayManager::handleRebootMessage, this, std::placeholders::_1));
     m_messageCallbacks.emplace(m_config.mqttTopicPrefix + "/command/exit", std::bind(&WinkRelayManager::handleExitMessage, this, std::placeholders::_1));
+    m_messageCallbacks.emplace(m_config.mqttTopicPrefix + "/command/alert", std::bind(&WinkRelayManager::handleAlertMessage, this, std::placeholders::_1));
 
     MQTTAsync_connectOptions conn_opts = MQTTAsync_connectOptions_initializer;
     MQTTAsync_create(&m_mqttClient, m_config.mqttAddress.c_str(), m_config.mqttClientId.c_str(), MQTTCLIENT_PERSISTENCE_NONE, NULL);
