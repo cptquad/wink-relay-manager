@@ -127,12 +127,36 @@ where:
 <MQTTPrefix>/screen/
 <MQTTPrefix>/command/exit // exits the process (any payload)
 <MQTTPrefix>/command/reboot // reboots the device (any payload)
+<MQTTPrefix>/command/alert // plays an alert sound (payload controls sound/count)
 
 where:
 <relay> is: 0 or 1
 MQTT payloads:
 1 or case insensive "on" for enabling
 or 0 or case insensitive "off" for disabling
+```
+
+#####  Alert sound (MQTT-triggered)
+To enable alert sounds, add the following config values:
+```
+alert_sound=/system/media/audio/ui/Effect_Tick.ogg
+# Optional override (otherwise defaults to: stagefright -a <sound>)
+#alert_player=stagefright
+#alert_player_args=-a
+alert_max_count=5
+alert_repeat_delay_ms=300
+```
+Publish to:
+```
+<MQTTPrefix>/command/alert
+```
+Payload examples:
+```
+ON               # play alert_sound once
+3                # play alert_sound 3 times
+/sdcard/alert.wav # play this file once
+/sdcard/alert.wav,3 # play this file 3 times
+default          # play alert_sound once
 ```
 #####  Logging and Debug
 Logs default to using logcat
