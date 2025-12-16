@@ -388,9 +388,9 @@ public:
     std::string sound = m_config.alertSound;
     int count = 1;
 
-    if (payload.empty() || payload == "1" || strncasecmp(payload.c_str(), "on", payload.size()) == 0) {
+    if (payload.empty() || payload == "1" || strcasecmp(payload.c_str(), "on") == 0) {
       // default sound, once
-    } else if (strncasecmp(payload.c_str(), "default", payload.size()) == 0) {
+    } else if (strcasecmp(payload.c_str(), "default") == 0) {
       // default sound, once
     } else {
       // Accept either:
